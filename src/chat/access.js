@@ -8,9 +8,17 @@ export const LEVELS = ['full', 'social', 'chat']
  * @param {{kind:'private'|'group', userId:string, groupId:string}} msg
  * @returns {{allowed: boolean, reason: string}}
  */
+/** 打开后私聊一律不收也不发，主人私聊也不例外。默认关，旧配置行为不变。 */
+export const GROUP_ONLY_REASON = '只在群里说话'
+
+export function groupOnlyEnabled(cfg) {
+  return cfg?.groupOnly === true
+}
+
 export function checkAllowed(cfg, msg) {
   const owner = String(cfg.ownerQQ || '')
   if (msg.kind === 'private') {
+    if (groupOnlyEnabled(cfg)) return { allowed: false, reason: GROUP_ONLY_REASON }
     if (msg.userId === owner) return { allowed: true, reason: '主人' }
     const list = (cfg.allow?.private || []).map(String)
     return list.includes(msg.userId)
@@ -36,6 +44,59 @@ export function levelFor(cfg, chat) {
 export function presetFor(level, cfg) {
   if (level !== 'full') return 'aurabot-social'
   return cfg && cfg.longTasks ? 'aurabot-private-long' : 'aurabot-private'
+}
+
+const PRIVATE_ACTIONS = new Set([
+  'send_private_msg',
+  'upload_private_file',
+  'send_private_forward_msg',
+  'forward_friend_single_msg',
+  'friend_poke',
+  'set_input_status',
+])
+const FLEXIBLE_ACTIONS = new Set(['send_msg', 'send_forward_msg', 'send_custom_face', 'send_tuwen_ark', 'send_ark_share'])
+
+function presentId(value) {
+  if (value === undefined || value === null) return false
+  const text = String(value).trim()
+  return text !== '' && text !== '0'
+}
+
+/** 这个 OneBot 动作会不会把内容发进私聊。群动作、查询和状态接口返回 false。 */
+export function privateSendTarget(action, params = {}) {
+  const name = String(action || '').trim().toLowerCase()
+  if (!name) return false
+  if (PRIVATE_ACTIONS.has(name)) return true
+  const body = params && typeof params === 'object' ? params : {}
+  const messageType = String(body.message_type || body.messageType || '').trim().toLowerCase()
+  const hasGroup = presentId(body.group_id ?? body.groupId)
+  const hasUser = presentId(body.user_id ?? body.userId ?? body.target_id ?? body.targetId)
+  if (name === 'send_poke') return !hasGroup
+  if (!FLEXIBLE_ACTIONS.has(name)) return false
+  if (messageType === 'private' || messageType === 'friend') return true
+  if (messageType === 'group') return false
+  if (hasGroup) return false
+  return hasUser
+}
+
+/** 群里模式拦私聊发送时返回原因，否则空串。 */
+export function privateSendRefusal(cfg, action, params) {
+  return groupOnlyEnabled(cfg) && privateSendTarget(action, params) ? GROUP_ONLY_REASON : ''
+}
+
+/** 要拦就返回网关错误数据；不拦返回 null。宿主把它变成 OneBot 的明确拒绝，查询接口不受影响。 */
+export function rejectPrivateCall(cfg, action, params) {
+  const message = privateSendRefusal(cfg, action, params)
+  return message ? { action, status: 'failed', retcode: 1403, message } : null
+}
+
+/** 私聊消息和私聊戳一戳在群里模式下直接丢掉。好友申请等其它事件不算对话。 */
+export function groupOnlyDropsEvent(cfg, event) {
+  if (!groupOnlyEnabled(cfg) || !event) return false
+  const post = String(event.post_type || '').toLowerCase()
+  const type = String(event.message_type || event.messageType || '').toLowerCase()
+  if ((post === 'message' || post === 'message_sent') && type === 'private') return true
+  return post === 'notice' && event.notice_type === 'notify' && event.sub_type === 'poke' && !presentId(event.group_id)
 }
 
 /** 只有主人能做的事（群管、点歌、写文件……）。 */

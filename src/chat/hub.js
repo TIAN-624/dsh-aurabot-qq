@@ -13,7 +13,7 @@ import { dataDir, readJson, writeJson } from '../core/store.js'
 import { parseMessageEvent, gifFrames, segmentsOf } from './inbound.js'
 import { parseReply, bubbleDelay, wantsVoice, cleanOutboundText, cleanOutboundSegments } from './reply.js'
 import { decideGroupReply, engagedHint, pickAutoReply, pickDirectRequester, policyFor, sameNameNote, topicRelevance } from './group-policy.js'
-import { checkAllowed, levelFor, presetFor, isOwner } from './access.js'
+import { GROUP_ONLY_REASON, checkAllowed, levelFor, presetFor, isOwner } from './access.js'
 import { fetchImage, fetchLocalAsset, localAssetUrl, segmentBytes } from '../core/net.js'
 import { toMono16k } from '../voice/wav.js'
 import { mimeOf } from './inbound.js'
@@ -274,6 +274,7 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
   async function onNotice(ev) {
     const cfg = getConfig()
     const groupId = ev.group_id ? String(ev.group_id) : ''
+    if (!groupId && cfg.groupOnly) return log.info(`${GROUP_ONLY_REASON}，私聊通知不记`)
     if (groupId ? !cfg.allow.groups.map(String).includes(groupId) : !cfg.allow.private.map(String).includes(String(ev.user_id)) && String(ev.user_id) !== String(cfg.ownerQQ)) return
     const names = new Map()
     for (const qq of new Set([ev.user_id, ev.operator_id, ev.sender_id].filter(Boolean))) {
@@ -601,11 +602,20 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
   }
 
   // quiet：这一条是额外的（比如语音后面补发的表情），失败了不算到这一轮头上（deliver 按 failStore 里的条数判断整条有没有发出去）。
+  function refusePrivate(chatId, what) {
+    const tgt = targetOf(chatId)
+    if (!getConfig().groupOnly || !tgt || tgt.kind !== 'private') return false
+    log.info(`${chatId}：${GROUP_ONLY_REASON}，${what}不发`)
+    failStore.getStore()?.push({ message: GROUP_ONLY_REASON, privateBlocked: true })
+    return true
+  }
+
   async function sendSegments(chatId, message, note, { force = false, isCurrent = null, throwOnError = false, timeoutMs, quiet = false } = {}) {
     if (disposed) return null
     const cfg = getConfig()
     const tgt = targetOf(chatId)
     if (!tgt) return null
+    if (refusePrivate(chatId, '私聊')) return null
     const cleaning = cleaningFor(chatId)
     // 转发到其他平台的 send 钩子也只能拿到清洗后的正文。
     message = cleanOutboundSegments(message, cleaning)
@@ -733,6 +743,7 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
     const group = chatId.startsWith('group:') ? chatId.slice(6) : ''
     const target = group ? lastPoker.get(chatId) || lastSpeaker.get(chatId) : chatId.slice(8)
     if (!target) return
+    if (refusePrivate(chatId, '私聊戳一戳')) return
     if (!cfg.enabled || cfg.dryRun) return log.info(`试运行（没真戳）→ ${chatId}：戳了戳 ${target}`)
     try {
       await onebot.call('send_poke', { user_id: Number(target), ...(group ? { group_id: Number(group) } : {}) }, { timeoutMs: 10000 })
@@ -799,6 +810,7 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
     const cfg = getConfig()
     const tgt = targetOf(chatId)
     if (!tgt) return null
+    if (refusePrivate(chatId, '私聊文件')) throw new Error(GROUP_ONLY_REASON)
     if (!cfg.files?.enabled) throw new Error('发文件没打开（面板「聊天」页 → 发文件），打开后才能发')
     const { src, external, size, maxBytes } = checkSendableFile(cfg, file)
     // 文件显示名也会出现在 QQ 文件卡片上：和正文一样过一遍出站清洗，避免工具文字/提示词借文件名露出。
@@ -1410,6 +1422,7 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
     const cfg = getConfig()
     const msg = parseMessageEvent(event, selfId, { faceName: faces.nameOf })
     if (msg.userId === selfId) return
+    if (msg.kind === 'private' && cfg.groupOnly) return log.info(`${msg.chatId}：${GROUP_ONLY_REASON}，这条私聊不处理`)
     // 按群头衔过滤：这条当没看见（不进群聊上下文、不触发回复，@ 她、主人命令也一样）
     if (msg.kind === 'group' && await titleFilter.shouldIgnore(event)) return
     if (disposed) return
@@ -1655,6 +1668,7 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
 
   async function onPoke(ev) {
     if (disposed) return
+    if (!ev.group_id && getConfig().groupOnly) return log.info(`${GROUP_ONLY_REASON}，私聊戳一戳不处理`)
     const self = String(ev.self_id || selfId || getConfig().botQQ)
     if (String(ev.target_id) !== self) return
     if (hooks?.poke) {
@@ -1911,7 +1925,7 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
   function startTyping(key, chat) {
     if (disposed) return
     const cfg = getConfig()
-    if (chat.kind !== 'private' || !cfg.enabled || cfg.dryRun || typing.has(key)) return
+    if (chat.kind !== 'private' || cfg.groupOnly || !cfg.enabled || cfg.dryRun || typing.has(key)) return
     const ping = () => { if (!disposed) onebot.call('set_input_status', { user_id: Number(chat.userId), event_type: 1 }, { timeoutMs: 5000 }).catch(() => {}) }
     ping()
     const started = Date.now()

@@ -5,6 +5,7 @@ import { defineTool, str } from '../../tools/tools.js'
 import { QQ_API, paramsOf } from './actions.js'
 import { clipText } from '../../core/text.js'
 import { cleanOutboundText } from '../../chat/reply.js'
+import { privateSendRefusal } from '../../chat/access.js'
 
 const RESULT_CHARS = 3000
 
@@ -15,6 +16,8 @@ const OUT_GROUP_TARGET = new Set(['forward_group_single_msg', 'send_group_forwar
 
 /** 目标是白名单外的人/群就返回原因。 */
 export function outboundRefusal({ action, params, cfg }) {
+  const gated = privateSendRefusal(cfg, action, params)
+  if (gated) return gated
   const allowP = (cfg.allow?.private || []).map(String)
   const allowG = (cfg.allow?.groups || []).map(String)
   const uid = params.user_id ?? params.target_id

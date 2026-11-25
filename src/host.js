@@ -16,7 +16,8 @@ import { spawn } from 'node:child_process'
 import { loadConfig, saveConfig, publicConfig, mergeFromPanel } from './core/config.js'
 import { createLogger } from './core/logger.js'
 import { registerSecret, redact } from './core/redact.js'
-import { createOneBotClient } from './onebot/client.js'
+import { createOneBotClient, OneBotError } from './onebot/client.js'
+import { GROUP_ONLY_REASON, groupOnlyDropsEvent, rejectPrivateCall } from './chat/access.js'
 import { createSnowLumaManager, DOWNLOAD_PAGE } from './snowluma/manager.js'
 import { createHub, workspaceDirOf } from './chat/hub.js'
 import { grantOwner, moveWorkspace, realWorkspace } from './core/workspace-move.js'
@@ -168,6 +169,7 @@ export function apply(ctx) {
   /** 核对通过后的事件都在这里处理（onEvent 直接调，核对期间攒下的也会补到这里）。 */
   function handleEvent(ev) {
     if (!hub) return
+    if (groupOnlyDropsEvent(cfg, ev)) return log.info(`${GROUP_ONLY_REASON}，这条私聊不处理`)
     // 模块能看到所有原始事件（加群、撤回、好友申请……），只看不拦
     mods?.emit('onebot', ev)
     if (ev.post_type === 'message' || ev.post_type === 'message_sent') {
@@ -214,6 +216,15 @@ export function apply(ctx) {
       handleEvent(ev)
     },
   })
+  const rawCall = onebot.call
+  onebot.call = (action, params, opts) => {
+    const blocked = rejectPrivateCall(getConfig(), action, params)
+    if (blocked) {
+      log.info(`${blocked.message}，拦下 ${action}`)
+      throw new OneBotError(action, blocked)
+    }
+    return rawCall(action, params, opts)
+  }
   const groupRoles = createGroupRoles({ onebot, getConfig, log: logger.child('chat') })
   const local = createLocal({ getConfig, log: logger })
   const mutes = createMutes()
@@ -610,7 +621,7 @@ export function apply(ctx) {
   }
   async function notifyApproval(session, event) {
     try {
-      if (!cfg.enabled || cfg.dryRun || cfg.approvalNotify === false) return
+      if (!cfg.enabled || cfg.dryRun || cfg.approvalNotify === false || cfg.groupOnly) return
       if (!isAurabotWorkspaceSession(session)) return
       const d = event.data || {}
       const id = String(d.id || '')
@@ -1269,6 +1280,7 @@ export function apply(ctx) {
   route('/test-send', async () => {
     if (!cfg.enabled) return { ok: false, message: '先打开总开关' }
     if (cfg.dryRun) return { ok: false, message: '现在是试运行，先关掉试运行再测' }
+    if (cfg.groupOnly) return { ok: false, message: GROUP_ONLY_REASON }
     const r = await hub.sendText(`private:${cfg.ownerQQ}`, '【Aurabot 自测】大肥鱼到此一游～')
     return r ? { ok: true, message: '发给主人了，去 QQ 看看' } : { ok: false, message: '没发出去（看日志）' }
   })
