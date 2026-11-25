@@ -103,10 +103,13 @@ test('群里回复写本机图片：允许目录外的不发，数据目录里�
   writeFileSync(outside, '图')
   t.after(() => rmSync(outside, { force: true }))
   await s.hub.deliver('group:9', `![图](${outside})`)
-  assert.equal(s.calls.length, 0)
+  assert.equal(s.calls.length, 1)
+  assert.equal(s.calls[0].params.message.at(-1).type, 'text')
+  assert.equal(s.calls[0].params.message.at(-1).data.text, '图没发出去')
+  assert.ok(!JSON.stringify(s.calls).includes(outside))
   assert.ok(s.logs.some((line) => line.includes('不在允许的目录里')))
   await s.hub.deliver('group:9', `![图](${s.file})`)
-  assert.equal(s.calls.length, 1)
+  assert.equal(s.calls.length, 2)
 })
 
 // —— 发图：本地路径优先直发，只有网关明确拒绝才转 base64（#169）——

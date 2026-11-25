@@ -119,6 +119,71 @@ export async function assertPublicUrl(url) {
   if (ssrfBlocked(ips)) throw new Error('不允许访问内网地址')
 }
 
+// ---------- 本机第一方表情资源 ----------
+// 模型回复里的普通网址仍然走上面的 SSRF 检查。唯一的例外是「当前这个 DSH 进程自己的网页端口」上、
+// 路径精确落到表情 GIF 的地址（nekowhale 默认路由 /x-nekowhale-stickers/s|r/<12-16 位十六进制>.gif）。
+// 不放开 localhost 域名、其它端口、其它路径（余额接口、面板、任意文件），也不跟重定向、不解析 DNS。
+const LOCAL_STICKER_PATH = /^\/x-nekowhale-stickers\/(?:s|r)\/[0-9a-f]{12,16}\.gif$/
+let assetPortGetter = () => 0
+/** 宿主注入当前 DSH 网页端口。传非函数则清空（测试用）。端口未知时本机表情地址一律不放行。 */
+export function setLocalAssetPort(fn) { assetPortGetter = typeof fn === 'function' ? fn : () => 0 }
+export function currentLocalAssetPort() {
+  const port = Number(assetPortGetter())
+  return Number.isInteger(port) && port > 0 && port < 65536 ? port : 0
+}
+
+/**
+ * 是本机表情 GIF 才返回规范化后的地址，否则返回空字符串。
+ * 调用方只能去拉这个返回值，不能拉原始字符串。
+ */
+export function localAssetUrl(url, port = currentLocalAssetPort()) {
+  const raw = String(url ?? '').trim()
+  if (!raw || /[\u0000-\u001f\u007f\\]/.test(raw)) return ''
+  if (/%2e|%2f|%5c|%00/i.test(raw) || raw.includes('..')) return ''
+  let u
+  try { u = new URL(raw) } catch { return '' }
+  if (u.protocol !== 'http:') return ''
+  if (u.username || u.password || u.search || u.hash) return ''
+  if (u.hostname !== '127.0.0.1') return ''
+  const p = Number(port)
+  if (!Number.isInteger(p) || p <= 0 || p >= 65536 || u.port !== String(p)) return ''
+  if (!LOCAL_STICKER_PATH.test(u.pathname) || !raw.includes(u.pathname)) return ''
+  return `http://127.0.0.1:${p}${u.pathname}`
+}
+
+/** 只拉取 localAssetUrl 认过的那一个地址：不跟随重定向，响应必须是 GIF。 */
+export async function fetchLocalAsset(url, o = {}) {
+  const canonical = localAssetUrl(url, o.port ?? currentLocalAssetPort())
+  if (!canonical) throw new Error('不是本机表情资源')
+  const fetchImpl = o.fetchImpl || fetch
+  const r = await fetchImpl(canonical, { redirect: 'manual', signal: AbortSignal.timeout(o.timeoutMs ?? 20000) })
+  const cancel = async () => { try { await r.body?.cancel() } catch (error) {} }
+  if (r.status >= 300 && r.status < 400) { await cancel(); throw new Error('表情资源不能跳转') }
+  if (!r.ok) { await cancel(); throw new Error(`HTTP ${r.status}`) }
+  const type = String(r.headers.get('content-type') || '').split(';')[0].trim().toLowerCase()
+  if (type !== 'image/gif') { await cancel(); throw new Error('表情资源不是 GIF') }
+  const maxBytes = o.maxBytes ?? 10 * 1024 * 1024
+  const len = Number(r.headers.get('content-length') || 0)
+  if (len > maxBytes) { await cancel(); throw new Error('太大了') }
+  const reader = r.body.getReader()
+  const chunks = []
+  let total = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    total += value.length
+    if (total > maxBytes) {
+      try { await reader.cancel() } catch (error) {}
+      throw new Error('太大了')
+    }
+    chunks.push(Buffer.from(value))
+  }
+  const buf = Buffer.concat(chunks)
+  const magic = buf.subarray(0, 6).toString('ascii')
+  if (magic !== 'GIF87a' && magic !== 'GIF89a') throw new Error('表情资源不是 GIF')
+  return buf
+}
+
 /**
  * 手动跟重定向：每一跳都重新做 SSRF 检查，避免「公网地址 302 到你内网」。
  * 默认最多 5 跳；fetchImpl 只给测试注入。

@@ -14,7 +14,7 @@ import { parseMessageEvent, gifFrames, segmentsOf } from './inbound.js'
 import { parseReply, bubbleDelay, wantsVoice, cleanOutboundText, cleanOutboundSegments } from './reply.js'
 import { decideGroupReply, engagedHint, pickAutoReply, pickDirectRequester, policyFor, sameNameNote, topicRelevance } from './group-policy.js'
 import { checkAllowed, levelFor, presetFor, isOwner } from './access.js'
-import { fetchImage, segmentBytes } from '../core/net.js'
+import { fetchImage, fetchLocalAsset, localAssetUrl, segmentBytes } from '../core/net.js'
 import { toMono16k } from '../voice/wav.js'
 import { mimeOf } from './inbound.js'
 import { forwardBody, readForward } from './forward.js'
@@ -78,7 +78,7 @@ export function assistantReplyText (message) {
   return message.content.filter((b) => b && b.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n').trim()
 }
 
-export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildTools, contextProviders, onActivity, memoryScore, onMemoryCommand, onCommand, isMuted, dislikes, random = Math.random, moodEffects, localApi, hooks, availableModels, toolsGeneration, capabilitiesOf }) {
+export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildTools, contextProviders, onActivity, memoryScore, onMemoryCommand, onCommand, isMuted, dislikes, random = Math.random, moodEffects, localApi, hooks, availableModels, toolsGeneration, capabilitiesOf, fetchImpl }) {
   // 心情对行为的影响（表情 / 语音概率、回复快慢、插话积极程度），没接就是 1
   const mood = () => (typeof moodEffects === 'function' ? moodEffects() : null) || { sticker: 1, voice: 1, delay: 1, chatty: 1 }
   const mapFile = () => dataDir('sessions.json')
@@ -877,10 +877,23 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
     } catch (error) { return true }
   }
 
+  // 记进这一轮的失败清单。给用户和模型看的句子里不带内网地址、路径或网关原文。
+  function recordImageFailure({ uncertain }) {
+    failStore.getStore()?.push({ message: uncertain ? '图片可能已经发出去了' : '图片没发出去', image: true, uncertain: Boolean(uncertain) })
+  }
+  const safeImageError = (error) => String(error?.message || error).replace(/https?:\/\/\S+/gi, '[地址]').slice(0, 180)
+
+  async function loadOutboundImage(src) {
+    // 本机表情 GIF 不走公网 SSRF 放行；其它网址（包括看起来像内网的）仍由 fetchImage 拒绝。
+    if (localAssetUrl(src)) return fetchLocalAsset(src, { maxBytes: MAX_IMAGE_BYTES, fetchImpl })
+    return fetchImage(src, { maxBytes: MAX_IMAGE_BYTES, fetchImpl })
+  }
+
   /**
    * 发一张图。本地绝对路径（或 file://）先试「路径直发」——网关和 NapCat 在同一台机器/共享挂载时，省掉读盘和
    * base64 膨胀（#169）。只有网关明确拒绝（路径读不到、retcode 非 0）才改用 base64；超时、断线可能已经发出去了，
    * 再发会变成两张，所以不回退。files.imageByPath 关掉就一直是 base64。
+   * 本机表情 GIF（当前 DSH 端口上的固定路径）在这里拉成字节再发；其它网址仍受 SSRF 检查。
    */
   async function sendImage(chatId, src, replyId, userId, opts = {}) {
     if (disposed) return null
@@ -901,6 +914,7 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
       } catch (error) {
         if (!isDefiniteFailure(error)) {
           log.warn(`${chatId}：按路径发图失败，发送结果不确定，不再重发：`, error.message)
+          recordImageFailure({ uncertain: true })
           // 调用方要发别的形态（比如 qq_send_file 想改用 sendFile）时，得知道「可能已经发出去了」，不能接着发第二份
           if (opts.strict) throw new Error(`图片可能已经发出去了，但网关没确认：${error.message}`)
           return null
@@ -908,11 +922,27 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
         log.debug(`${chatId}：按路径发不出去，改用 base64：`, error.message)
       }
     }
+    let buf
     try {
-      const buf = await fetchImage(s, { maxBytes: MAX_IMAGE_BYTES })
-      return sendSegments(chatId, [...head, { type: 'image', data: { file: 'base64://' + buf.toString('base64') } }], `[图片] ${s.slice(-40)}`)
+      buf = await loadOutboundImage(s)
     } catch (error) {
-      log.warn('图片发不出去：', error.message)
+      log.warn('图片发不出去：', safeImageError(error))
+      recordImageFailure({ uncertain: false })
+      return null
+    }
+    // 网关明确拒绝才算没发出去；超时/断线可能已经发出，不能再补一句「没发出去」。
+    const note = /^https?:\/\//i.test(s) ? '[图片]' : `[图片] ${s.slice(-40)}`
+    try {
+      return await sendSegments(chatId, [...head, { type: 'image', data: { file: 'base64://' + buf.toString('base64') } }], note, { throwOnError: true })
+    } catch (error) {
+      if (!isDefiniteFailure(error)) {
+        log.warn(`${chatId}：图片发送结果不确定，不再重发：`, error.message)
+        recordImageFailure({ uncertain: true })
+        if (opts.strict) throw new Error(`图片可能已经发出去了，但网关没确认：${error.message}`)
+        return null
+      }
+      log.warn('图片发不出去：', safeImageError(error))
+      recordImageFailure({ uncertain: false })
       return null
     }
   }
@@ -995,6 +1025,11 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
     const firstSendable = items.findIndex((item) => item.kind === 'text' || item.kind === 'voice' || item.kind === 'image' || (item.kind === 'sticker' && cfg.stickers.enabled && Boolean(item.value && typeof item.value === 'object' ? item.value : stickers.match(item.value))))
     const missedAt = [] // 写了 @ 却没对上群里人的名字
     const failures = []
+    const imageOutcomes = [] // 与回复里的图片一一对应：ok / fail / uncertain
+    let otherDelivered = 0
+    let saidOverride = ''
+    const isImageFail = (f) => Boolean(f && typeof f === 'object' && f.image)
+    const publicErrors = (list) => list.map((f) => typeof f === 'string' ? f : (f?.message || '没发出去'))
     await failStore.run(failures, async () => {
       for (let i = 0; i < items.length; i++) {
         if (disposed) return
@@ -1004,6 +1039,7 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
         // 她自己引用了 @ 她的人就照常 @；自动回复只有一个人说话时才有（#160）
         const userId = selected && (selected.direct || opts.autoReply?.uid === selected.uid) ? selected.uid : undefined
         if (it.replyTo && !replyId) log.debug(`${chatId}：引用的编号 ${it.replyTo} 对不上，正常发`)
+        const before = failures.length
         if (it.kind === 'text') await sendText(chatId, it.value, replyId, missedAt, userId)
         else if (it.kind === 'voice') {
           if (cfg.voice.enabled) await sendVoice(chatId, it.value, replyId, userId)
@@ -1011,33 +1047,60 @@ export function createHub({ dsh, getConfig, log, onebot, stickers, tts, buildToo
         } else if (it.kind === 'sticker') await sendSticker(chatId, it.value, replyId, userId)
         else if (it.kind === 'poke') { if (!opts.simulate) await pokeBack(chatId) }
         else if (it.kind === 'image') {
-          if (localImageBlocked(chatId, it.value)) log.warn(`${chatId}：回复里的本机图片不在允许的目录里，没发`)
-          else await sendImage(chatId, it.value, replyId, userId)
+          if (localImageBlocked(chatId, it.value)) {
+            log.warn(`${chatId}：回复里的本机图片不在允许的目录里，没发`)
+            recordImageFailure({ uncertain: false })
+          } else await sendImage(chatId, it.value, replyId, userId)
+          const added = failures.slice(before)
+          imageOutcomes.push(added.some((f) => f && f.uncertain) ? 'uncertain' : added.length ? 'fail' : 'ok')
         }
+        if (it.kind !== 'image' && it.kind !== 'poke' && failures.length === before) otherDelivered++
         if (i < items.length - 1 && !opts.simulate) await pause(bubbleDelay(items[i + 1].kind === 'text' ? items[i + 1].value : '') * mood().delay)
+      }
+      if (disposed || opts.simulate) return
+      if (outputScope.getStore()?.blocked && !outputScope.getStore()?.sent) return
+      // 这一轮除了戳一戳以外全是图，而且每张都确定没发出去：补一句短说明，避免群里完全没回复。
+      const onlyImages = items.length > 0 && items.every((i) => i.kind === 'image' || i.kind === 'poke')
+      const imagesFailed = imageOutcomes.length > 0 && imageOutcomes.every((o) => o === 'fail')
+      if (onlyImages && imagesFailed && cfg.enabled && !cfg.dryRun) {
+        const stickerish = items.filter((i) => i.kind === 'image').every((i) => localAssetUrl(i.value))
+        const fallback = stickerish ? '表情没发出去' : '图没发出去'
+        const r = await sendText(chatId, fallback)
+        if (r && r.message_id !== undefined) {
+          const poke = items.some((i) => i.kind === 'poke') ? '[poke] ' : ''
+          saidOverride = `${poke}${fallback}`
+        }
       }
     })
     if (disposed) return
     if (outputScope.getStore().blocked && !outputScope.getStore().sent) return silenceTurn(chatId)
     if (opts.simulate) return items
+    // 图失败但旁边的文字已经发出去时，不再把整轮算成失败，避免调用方再发一遍。
+    const reported = failures.filter((f) => !(isImageFail(f) && (saidOverride || otherDelivered > 0)))
+    const errors = publicErrors(reported)
     // 一条都没发出去：不记流水，她没说出口的话不能算说过
-    if (failures.length && failures.length >= items.filter((i) => i.kind !== 'poke').length) return { missedAt, failed: failures.length, errors: failures }
+    if (!saidOverride && reported.length && reported.length >= items.filter((i) => i.kind !== 'poke').length) return { missedAt, failed: reported.length, errors }
+    let imageCursor = 0
+    const said = saidOverride || items.map((i) => {
+      if (i.kind === 'image') return imageOutcomes[imageCursor++] === 'ok' ? '[image]' : ''
+      return i.kind === 'text' || i.kind === 'voice' ? i.value : `[${i.kind}]`
+    }).filter(Boolean).join(' ')
+    if (!said) return { missedAt, failed: reported.length, errors }
     if (inGroup) {
       const gid = chatId.slice(6)
-      const said = (groupSaid.get(gid) || []).filter((t) => Date.now() - t < 3600_000)
-      said.push(Date.now())
-      groupSaid.set(gid, said)
+      const saidTimes = (groupSaid.get(gid) || []).filter((t) => Date.now() - t < 3600_000)
+      saidTimes.push(Date.now())
+      groupSaid.set(gid, saidTimes)
       groupEngaged.set(gid, Date.now() + ENGAGE_MS) // 在群里说了话 = 加入了话题
     }
-    const said = items.map((i) => (i.kind === 'text' || i.kind === 'voice' ? i.value : `[${i.kind}]`)).join(' ')
     logChat(chatId, 'bot', said)
     // 不是这个聊天自己那一轮发的（主人在私聊里让她去群里说、扩展模块代发）：记下来，下次这个聊天交给她时告诉她自己说过什么
     if (!opts.own) saidElsewhere.set(chatId, [...(saidElsewhere.get(chatId) || []), { at: Date.now(), text: said.slice(0, 300) }].slice(-5))
     lastChatAt = Date.now()
     if (chatId.startsWith('private:')) lastPrivateAt.set(chatId.slice(8), Date.now())
-    if (chatId === `private:${cfg.ownerQQ}`) lastBotToOwner = { at: Date.now(), text: items.filter((i) => i.kind === 'text' || i.kind === 'voice').map((i) => i.value).join('\n') }
+    if (chatId === `private:${cfg.ownerQQ}`) lastBotToOwner = { at: Date.now(), text: saidOverride || items.filter((i) => i.kind === 'text' || i.kind === 'voice').map((i) => i.value).join('\n') }
     onActivity?.({ kind: 'out', chatId, reply: text, userText: opts.userText || '' })
-    return { missedAt, failed: failures.length, errors: failures }
+    return { missedAt, failed: reported.length, errors }
   }
 
   // ---------- 盯 DSH 会话：一轮结束就发 ----------

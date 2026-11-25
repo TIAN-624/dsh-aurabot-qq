@@ -36,7 +36,7 @@ import { applyPendingRestore, cancelRestore, createBackup, listBackups, pendingM
 import { cleanText } from './core/text.js'
 import { createBridge } from './core/bridge.js'
 import { createDangerGuard, safeOwnedSession } from './security/danger.js'
-import { setSsrpMode, assertPublicUrl, fetchGuarded } from './core/net.js'
+import { setSsrpMode, setLocalAssetPort, assertPublicUrl, fetchGuarded } from './core/net.js'
 import { BUILTINS } from './modules/index.js'
 
 export const name = 'aurabot'
@@ -555,6 +555,8 @@ export function apply(ctx) {
     }
     return Number.isInteger(port) && port > 0 && port < 65536 ? port : 0
   }
+  // 回复里的本机表情地址只认这个端口，而且只认表情 GIF 路径（见 core/net.js）。端口没就绪时不放行。
+  setLocalAssetPort(() => webPortOf())
   // ---------- 桌宠远端直连（publicBaseUrl，2026-11-02）----------
   // 单一真相：ext.pet.publicBaseUrl（pet 模块 api.settings() 读同一键；面板写入通道见 /panel/pet/config 与
   // /panel/pet/public-base）。合法 http(s) URL 才生效；配置后 pet 的 host.json 写远端地址、guard 放行远端
